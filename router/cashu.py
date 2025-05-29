@@ -17,33 +17,60 @@ WALLET = None
 #TODO
 # This causes problems when users send tokens from other mints
 # WALLET is already set so it returns the specified wallet, but this wallet does not know the keyset of the token 
+# Define the global dictionary to hold wallets (fixes "WALLETS doesn't exist")
+WALLETS: dict[str, Wallet] = {}  # Maps mint URLs to initialized wallets
+
+# ... (other imports and constants remain the same) ...
+
 async def _initialize_wallet(mint_url: str | None = None) -> Wallet:
-    """Initializes and loads a Cashu wallet."""
-    global WALLET
-    if WALLET is not None:
-        return WALLET
+    """Initializes and loads a Cashu wallet with isolated storage via unique names."""
     if mint_url is None:
-        mint_url = MINT
+        mint_url = MINT  # Use the default MINT URL if none provided
+    
+    # Create a unique wallet identifier based on mint URL
+    mint_identifier = (
+        mint_url.replace("://", "_").replace(".", "_").replace("/", "_").lower()
+    )
+    wallet_name = f"cashu_wallet_{mint_identifier}"
+    
+    # Check if wallet already exists in the dictionary
+    if mint_url in WALLETS:
+        print(f"found wallet: {mint_url}")
+        return WALLETS[mint_url]
+    
+    print(f"Initializing wallet for mint: {mint_url}")
+    
+    #TODO same direction but different names!
+    # Initialize the wallet with unique name and shared base directory
     wallet = await Wallet.with_db(
         mint_url,
-        db=".",
-        load_all_keysets=True,
-        unit="sat",  # todo change to msat
+        db=f"./{wallet_name}",  # Full path combines base + unique name
+        name=wallet_name,       # Unique identifier
+        load_all_keysets=True,  # Ensure all keysets are loaded
+        unit="sat",
     )
-    print(f"initialized cashu wallet at mint {mint_url}", flush=True)
+    
+    # Load mint info and keysets
     await wallet.load_mint_info()
     await wallet.load_mint_keysets()
+    
+    # Activate keyset if none is active
     if not hasattr(wallet, "keyset_id") or wallet.keyset_id is None:
         await wallet.activate_keyset()
+    
+    # Load existing proofs
     await wallet.load_proofs(reload=True)
-    WALLET = wallet
+    print(f"{wallet.balance=}")
+    # Store the initialized wallet in the global dict
+    WALLETS[mint_url] = wallet
     return wallet
-
 
 async def _handle_token_receive(wallet: Wallet, token_obj: Token) -> int:
     """Receives a token and returns the amount received."""
     initial_balance = wallet.available_balance
+    print("receive")
     await receive(wallet, token_obj)
+    print("load_proofs")
     await wallet.load_proofs(reload=True)
     final_balance = wallet.available_balance
     amount_received = final_balance - initial_balance
@@ -73,18 +100,18 @@ async def _pay_invoice_with_cashu(
 ) -> int:
     """Pays a BOLT11 invoice using Cashu proofs via melt."""
 
-    amount_to_send_msat = amount_to_send_msat // 1000
+    amount_to_send_msat = amount_to_send_msat // 1000 #???????????TDOODO
     quote = await wallet.melt_quote(bolt11_invoice, amount_to_send_msat)
 
     proofs_to_melt, _ = await wallet.select_to_send(
         wallet.proofs, quote.amount + quote.fee_reserve
     )
-    print(f"Proofs to melt: {proofs_to_melt}")
+    #print(f"Proofs to melt: {proofs_to_melt}")
 
     _ = await wallet.melt(
         proofs_to_melt, bolt11_invoice, quote.fee_reserve, quote.quote
     )
-
+    print(f"Payed {quote.amount}")
     return quote.amount
 
 
@@ -146,16 +173,89 @@ async def pay_out(session: AsyncSession) -> None:
         # Log the error but don't crash - payouts can be retried later
         print(f"Error in pay_out: {e}")
 
-
 async def credit_balance(cashu_token: str, key: ApiKey, session: AsyncSession) -> int:
-    token_obj: Token = deserialize_token_from_string(cashu_token)
-    wallet: Wallet = await _initialize_wallet(token_obj.mint)
-    amount_msats = await _handle_token_receive(wallet, token_obj)
-    key.balance += amount_msats
-    session.add(key)
-    await session.commit()
-    return amount_msats
+    # 1. Deserialize token and validate
+    try:
+        token_obj: Token = deserialize_token_from_string(cashu_token)
+        token_mint = token_obj.mint
+        print(f"[DEBUG] Received token from mint: {token_mint}")
+    except Exception as e:
+        raise RuntimeError(f"Failed to deserialize token: {e}")
 
+    # 2. Check if token is from foreign mint
+    if token_mint != MINT:
+        print("=== CROSS-MINT TRANSACTION ===")
+
+        # Step 1: Initialize foreign wallet
+        try:
+            foreign_wallet = await _initialize_wallet(token_mint)
+            print(f"[DEBUG] Foreign wallet initialized for {token_mint}")
+        except Exception as e:
+            raise RuntimeError(f"Failed to initialize foreign wallet: {e}")
+
+        # Step 2: Receive tokens into foreign wallet
+        try:
+            foreign_amount_msats = await _handle_token_receive(foreign_wallet, token_obj)
+            assert foreign_amount_msats > 0, "Received zero tokens"
+            foreign_amount_sats = foreign_amount_msats // 1000
+            print(f"[DEBUG] Received {foreign_amount_sats} SAT from foreign mint")
+        except Exception as e:
+            raise RuntimeError(f"Token receive failed: {e}")
+
+        # Step 3: Calculate fees and net amount
+        fee_percent = 0.01
+        net_amount_sats = int(foreign_amount_sats * (1 - fee_percent))
+        print(f"[DEBUG] Net amount after fees: {net_amount_sats} SAT")
+
+        # Step 4: Create invoice from original mint
+        try:
+            original_wallet = await _initialize_wallet(MINT)
+            print(f"[DEBUG] Original wallet initialized for {MINT}")
+            mint_quote = await original_wallet.request_mint(
+                net_amount_sats, 
+                memo="Cross-mint conversion"
+            )
+            print(f"[DEBUG] Generated mint_quote: {mint_quote}")
+            invoice = mint_quote.request
+            print(f"[DEBUG] Generated invoice: {invoice}")
+        except Exception as e:
+            raise RuntimeError(f"Invoice creation failed: {e}")
+
+        # Step 5: Pay invoice using foreign tokens
+        try:
+            await _pay_invoice_with_cashu(
+                foreign_wallet, 
+                invoice, 
+                net_amount_sats * 1000  # Convert sats to msats
+            )
+            print(f"[DEBUG] Invoice paid successfully")
+        except Exception as e:
+            raise RuntimeError(f"Invoice payment failed: {e}")
+
+        # Final step: Credit user's balance
+        key.balance += net_amount_sats * 1000
+        session.add(key)
+        await session.commit()
+        print(f"[DEBUG] Balance credited: {net_amount_sats * 1000} msats")
+        return net_amount_sats * 1000
+
+    else:
+        print("=== SAME-MINT TRANSACTION ===")
+
+        # Handle same-mint case
+        try:
+            wallet = await _initialize_wallet(token_obj.mint)
+            amount_msats = await _handle_token_receive(wallet, token_obj)
+            assert amount_msats > 0, "Received zero tokens"
+            print(f"[DEBUG] Received {amount_msats} msats from same mint")
+        except Exception as e:
+            raise RuntimeError(f"Token receive failed: {e}")
+
+        key.balance += amount_msats
+        session.add(key)
+        await session.commit()
+        print(f"[DEBUG] Balance credited: {amount_msats} msats")
+        return amount_msats
 
 async def refund_balance(amount: int, key: ApiKey, session: AsyncSession) -> int:
     wallet = await _initialize_wallet()

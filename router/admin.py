@@ -97,7 +97,12 @@ async def dashboard(request: Request) -> str:
 
     # Fetch balance from cashu
     wallet = await _initialize_wallet()
+    await wallet.load_proofs(reload=True)  # <--- ADD THIS
     current_balance = wallet.balance  # Not awaited, assuming it's a property
+
+    wallet = await _initialize_wallet("https://mint.minibits.cash/Bitcoin")
+    await wallet.load_proofs(reload=True)  # <--- ADD THIS
+    minibits_balance = wallet.balance  # Not awaited, assuming it's a property
 
 
     return f"""<!DOCTYPE html>
@@ -118,7 +123,7 @@ async def dashboard(request: Request) -> str:
         <body>
             <h1>Admin Dashboard</h1>
             <h2>Current Cashu Balance (including user balances)</h2>
-            <p>{current_balance} sats</p>
+            <p>{current_balance} sats ({minibits_balance})</p>
             <h2>User's API Keys</h2>
             <table>
                 <tr>
