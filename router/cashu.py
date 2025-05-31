@@ -96,12 +96,12 @@ async def _get_lnurl_invoice(callback_url: str, amount_msat: int) -> tuple[str, 
 
 
 async def _pay_invoice_with_cashu(
-    wallet: Wallet, bolt11_invoice: str, amount_to_send_msat: int
+    wallet: Wallet, bolt11_invoice: str, amount_to_send_sat: int
 ) -> int:
     """Pays a BOLT11 invoice using Cashu proofs via melt."""
 
-    amount_to_send_msat = amount_to_send_msat // 1000 #???????????TDOODO
-    quote = await wallet.melt_quote(bolt11_invoice, amount_to_send_msat)
+    amount_to_send_sat = amount_to_send_sat // 1000
+    quote = await wallet.melt_quote(bolt11_invoice, amount_to_send_sat)
 
     proofs_to_melt, _ = await wallet.select_to_send(
         wallet.proofs, quote.amount + quote.fee_reserve
@@ -111,7 +111,7 @@ async def _pay_invoice_with_cashu(
     _ = await wallet.melt(
         proofs_to_melt, bolt11_invoice, quote.fee_reserve, quote.quote
     )
-    print(f"Payed {quote.amount}")
+    print(f"Payed {quote.amount} Sats")
     return quote.amount
 
 
@@ -173,6 +173,7 @@ async def pay_out(session: AsyncSession) -> None:
         # Log the error but don't crash - payouts can be retried later
         print(f"Error in pay_out: {e}")
 
+# TODO: If the transfer to the original mint fails: Refund the balance to lnurl (or return cashu token in response?)
 async def credit_balance(cashu_token: str, key: ApiKey, session: AsyncSession) -> int:
     # 1. Deserialize token and validate
     try:
@@ -184,60 +185,88 @@ async def credit_balance(cashu_token: str, key: ApiKey, session: AsyncSession) -
 
     # 2. Check if token is from foreign mint
     if token_mint != MINT:
-        print("=== CROSS-MINT TRANSACTION ===")
+        foreign_mint_url = token_obj.mint  # Mint URL from received token
+        original_mint_url = MINT  # Your target mint (original)
 
-        # Step 1: Initialize foreign wallet
+        # === DEBUG: Initialize wallets ===
+        print(f"[DEBUG] Initializing outgoing_wallet for mint: {foreign_mint_url}")
+        outgoing_wallet = await _initialize_wallet(foreign_mint_url)  # Foreign mint
+        print(f"[DEBUG] Initializing incoming_wallet for mint: {original_mint_url}")
+        incoming_wallet = await _initialize_wallet(original_mint_url)  # Original mint
+
+        # === DEBUG: Load mint info ===
+        await outgoing_wallet.load_mint_info()
+        print(f"[DEBUG] Outgoing wallet balance before: {outgoing_wallet.available_balance} SAT")
+        await incoming_wallet.load_mint_info()
+        print(f"[DEBUG] Incoming wallet balance before: {incoming_wallet.available_balance} SAT")
+
+        # 3. Receive the foreign token into the outgoing wallet
         try:
-            foreign_wallet = await _initialize_wallet(token_mint)
-            print(f"[DEBUG] Foreign wallet initialized for {token_mint}")
+            foreign_amount_msats = await _handle_token_receive(outgoing_wallet, token_obj)
+            print(f"[DEBUG] Received {foreign_amount_msats // 1000} SAT to {outgoing_wallet}")
         except Exception as e:
-            raise RuntimeError(f"Failed to initialize foreign wallet: {e}")
+            raise RuntimeError(f"Failed to handle token receive: {e}")
 
-        # Step 2: Receive tokens into foreign wallet
-        try:
-            foreign_amount_msats = await _handle_token_receive(foreign_wallet, token_obj)
-            assert foreign_amount_msats > 0, "Received zero tokens"
-            foreign_amount_sats = foreign_amount_msats // 1000
-            print(f"[DEBUG] Received {foreign_amount_sats} SAT from foreign mint")
-        except Exception as e:
-            raise RuntimeError(f"Token receive failed: {e}")
-
-        # Step 3: Calculate fees and net amount
-        fee_percent = 0.01
-        net_amount_sats = int(foreign_amount_sats * (1 - fee_percent))
+        # 4. Calculate net amount (subtract fees)
+        net_amount_msats = foreign_amount_msats - int(max(2000, foreign_amount_msats * 0.01))  # Fee logic taken from send_to_lnurl()
+        net_amount_sats = net_amount_msats // 1000
         print(f"[DEBUG] Net amount after fees: {net_amount_sats} SAT")
 
-        # Step 4: Create invoice from original mint
+        # 5. Request a mint quote from the incoming (original) mint
         try:
-            original_wallet = await _initialize_wallet(MINT)
-            print(f"[DEBUG] Original wallet initialized for {MINT}")
-            mint_quote = await original_wallet.request_mint(
-                net_amount_sats, 
-                memo="Cross-mint conversion"
-            )
-            print(f"[DEBUG] Generated mint_quote: {mint_quote}")
-            invoice = mint_quote.request
-            print(f"[DEBUG] Generated invoice: {invoice}")
+            mint_quote = await incoming_wallet.request_mint(net_amount_sats)
+            print(f"[DEBUG] Mint quote generated: {mint_quote}")
         except Exception as e:
-            raise RuntimeError(f"Invoice creation failed: {e}")
+            raise RuntimeError(f"Failed to request mint quote: {e}")
 
-        # Step 5: Pay invoice using foreign tokens
+        # 6. Prepare to melt outgoing proofs to pay the incoming mint's invoice
         try:
-            await _pay_invoice_with_cashu(
-                foreign_wallet, 
-                invoice, 
-                net_amount_sats * 1000  # Convert sats to msats
-            )
-            print(f"[DEBUG] Invoice paid successfully")
-        except Exception as e:
-            raise RuntimeError(f"Invoice payment failed: {e}")
+            melt_quote = await outgoing_wallet.melt_quote(mint_quote.request)
+            total_needed = melt_quote.amount + melt_quote.fee_reserve
+            print(f"[DEBUG] Total needed: {total_needed} SAT (amount: {melt_quote.amount} SAT + fee: {melt_quote.fee_reserve} SAT)")
 
-        # Final step: Credit user's balance
-        key.balance += net_amount_sats * 1000
+            if outgoing_wallet.available_balance < total_needed:
+                raise ValueError("Insufficient balance to cover fees.")
+        except Exception as e:
+            raise RuntimeError(f"Melt quote failed: {e}")
+
+        # 7. Select and melt outgoing proofs
+        try:
+            send_proofs, _ = await outgoing_wallet.select_to_send(
+                outgoing_wallet.proofs,
+                total_needed,
+                set_reserved=True
+            )
+            print(f"[DEBUG] Selected proofs to melt: {len(send_proofs)} proofs")
+            await outgoing_wallet.melt(
+                send_proofs,
+                mint_quote.request,
+                melt_quote.fee_reserve,
+                melt_quote.quote
+            )
+            print(f"[DEBUG] Melt operation succeeded. Outgoing wallet balance now: {outgoing_wallet.available_balance} SAT")
+        except Exception as e:
+            raise RuntimeError(f"Melt operation failed: {e}")
+
+        # 8. Mint new tokens on the incoming mint (some mints auto-trigger this)
+        try:
+            await incoming_wallet.mint(net_amount_sats, quote_id=mint_quote.quote)
+            print(f"[DEBUG] Minted {net_amount_sats} SAT on incoming wallet")
+        except Exception as e:
+            raise RuntimeError(f"Mint operation failed: {e}")
+
+        # 9. Reload incoming wallet's proofs to reflect new balance
+        await incoming_wallet.load_proofs(reload=True)
+        new_balance = incoming_wallet.available_balance
+        print(f"[DEBUG] Incoming wallet balance after mint: {new_balance} SAT")
+
+        # 10. Update user's balance in the database
+        key.balance += net_amount_msats
         session.add(key)
         await session.commit()
-        print(f"[DEBUG] Balance credited: {net_amount_sats * 1000} msats")
-        return net_amount_sats * 1000
+
+        print(f"[DEBUG] Balance credited: {net_amount_msats} msats")
+        return net_amount_msats
 
     else:
         print("=== SAME-MINT TRANSACTION ===")
@@ -245,9 +274,10 @@ async def credit_balance(cashu_token: str, key: ApiKey, session: AsyncSession) -
         # Handle same-mint case
         try:
             wallet = await _initialize_wallet(token_obj.mint)
+            print(f"[DEBUG] Initial balance before receive: {wallet.available_balance} SAT")
             amount_msats = await _handle_token_receive(wallet, token_obj)
             assert amount_msats > 0, "Received zero tokens"
-            print(f"[DEBUG] Received {amount_msats} msats from same mint")
+            print(f"[DEBUG] Received {amount_msats} msats from same mint. New balance: {wallet.available_balance} SAT")
         except Exception as e:
             raise RuntimeError(f"Token receive failed: {e}")
 
@@ -256,6 +286,9 @@ async def credit_balance(cashu_token: str, key: ApiKey, session: AsyncSession) -
         await session.commit()
         print(f"[DEBUG] Balance credited: {amount_msats} msats")
         return amount_msats
+    
+
+
 
 async def refund_balance(amount: int, key: ApiKey, session: AsyncSession) -> int:
     wallet = await _initialize_wallet()

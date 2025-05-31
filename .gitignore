@@ -9,3 +9,5 @@ wallet.sqlite3
 .*wallet.sqlite3
 .*models.json
 compose.override.yml
+
+*.egg-info/
